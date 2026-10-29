@@ -64,7 +64,7 @@ fn guard_json<F: FnOnce() -> *mut c_char>(f: F) -> *mut c_char {
 
 #[no_mangle]
 pub extern "C" fn me_version() -> *const c_char {
-    static VERSION_C: &[u8] = b"0.1.0\0";
+    static VERSION_C: &[u8] = b"0.2.0\0";
     VERSION_C.as_ptr() as *const c_char
 }
 

@@ -24,7 +24,7 @@ extern "C" {
 #define ME_ERR_INTERNAL 6
 #define ME_ERR_PARSE 7
 
-/* Library version string, e.g. "0.1.0". Static storage: do NOT
+/* Library version string, e.g. "0.2.0". Static storage: do NOT
  * free the returned pointer. */
 ME_API const char *me_version(void);
 
@@ -51,10 +51,19 @@ ME_API void me_free_string(char *p);
  *                "width":1920 | null, "height":1080 | null,
  *                "sample_rate":48000 | null,
  *                "channels":2 | null,
- *                "language":"eng" | null}]}
+ *                "language":"eng" | null,
+ *                "frame_rate":"30000/1001" | null,
+ *                "field_order":"progressive"|"tt"|"bb"|"tb"|"bt" | null}]}
  *
  * A field is null when the file does not carry that value;
- * MediaKit never guesses. duration_is_estimate is true only
+ * MediaKit never guesses. frame_rate (video streams; since 0.2.0)
+ * is an exact reduced fraction "num/den" from MP4/MOV stts timing
+ * (an average when timing varies), Matroska DefaultDuration, or AVI
+ * strh rate/scale. field_order (video; since 0.2.0) comes from the
+ * QuickTime fiel atom or Matroska FlagInterlaced/FieldOrder: first
+ * letter is the field coded first, second the field displayed
+ * first. Fields stored only inside the coded video (not in the
+ * container) are null: MediaKit reads headers, not frames. duration_is_estimate is true only
  * for MP3 files without a Xing/Info header, where duration is
  * derived from file size at the first frame's bitrate.
  *

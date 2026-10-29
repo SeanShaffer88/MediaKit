@@ -21,9 +21,9 @@ pub mod json;
 pub mod parsers;
 pub mod platform;
 
-pub const VERSION: &str = "0.1.0";
+pub const VERSION: &str = "0.2.0";
 pub const VERSION_MAJOR: u32 = 0;
-pub const VERSION_MINOR: u32 = 1;
+pub const VERSION_MINOR: u32 = 2;
 pub const VERSION_PATCH: u32 = 0;
 
 // Error codes (mirror include/mediakit.h).
@@ -64,6 +64,16 @@ pub struct StreamInfo {
     /// Language as stored (ISO 639 code from MP4 mdhd, string
     /// from Matroska/elng), untranslated.
     pub language: Option<String>,
+    /// Video frame rate as an exact fraction (numerator,
+    /// denominator), reduced. From MP4 `stts` sample timing and the
+    /// track timescale (an average when the timing varies), Matroska
+    /// `DefaultDuration`, or AVI `strh` rate/scale.
+    pub frame_rate: Option<(u64, u64)>,
+    /// Interlacing as stored: "progressive", "tt", "bb", "tb" or
+    /// "bt" (first letter: field coded first; second: field
+    /// displayed first). From the QuickTime `fiel` atom or Matroska
+    /// `FlagInterlaced`/`FieldOrder`.
+    pub field_order: Option<String>,
 }
 
 /// The probe result for one file.
@@ -131,6 +141,14 @@ impl StreamInfo {
             ("sample_rate", rate),
             ("channels", opt_u(&self.channels)),
             ("language", opt_s(&self.language)),
+            (
+                "frame_rate",
+                match self.frame_rate {
+                    Some((num, den)) => json::s(&format!("{num}/{den}")),
+                    None => json::Value::Null,
+                },
+            ),
+            ("field_order", opt_s(&self.field_order)),
         ])
     }
 }
@@ -420,6 +438,8 @@ mod unit_tests {
                 sample_rate: Some(8000.0),
                 channels: Some(1),
                 language: None,
+                frame_rate: None,
+                field_order: None,
             }],
         };
         let v = json::parse(&res.to_json()).unwrap();
@@ -434,5 +454,16 @@ mod unit_tests {
         assert_eq!(st.get("sample_rate").unwrap().as_i64(), Some(8000));
         assert!(st.get("width").unwrap() == &json::Value::Null);
         assert!(st.get("language").unwrap() == &json::Value::Null);
+        assert!(st.get("frame_rate").unwrap() == &json::Value::Null);
+        assert!(st.get("field_order").unwrap() == &json::Value::Null);
+
+        let mut video = res.clone();
+        video.streams[0].kind = "video".into();
+        video.streams[0].frame_rate = Some((30000, 1001));
+        video.streams[0].field_order = Some("tt".into());
+        let v = json::parse(&video.to_json()).unwrap();
+        let st = &v.get("streams").unwrap().as_array().unwrap()[0];
+        assert_eq!(st.get("frame_rate").unwrap().as_str(), Some("30000/1001"));
+        assert_eq!(st.get("field_order").unwrap().as_str(), Some("tt"));
     }
 }

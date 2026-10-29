@@ -21,5 +21,6 @@ is not claimed from Linux evidence.
 
 ## Waivers / open items
 
+- v0.2.0: frame rate and field order were cross-checked against ffprobe on FFmpeg-written MP4/MOV/MKV/AVI files (Linux); that run found and fixed two v0.1 QuickTime bugs (data-handler `hdlr` overwriting the track kind, Macintosh/unspecified language codes decoded as letters). Test count is now 45. Scores above still describe the v0.1.0 gate until a Windows run of v0.2.0 is observed.
 - Real-world files: all fixtures are synthetic. The parsers follow the published layouts, but no corpus of real recorder/camera/phone files has been probed yet. Follow-up: run a real-file corpus before claiming field-proven extraction, and add any odd-but-valid layout found as a fixture.
 - No dimension is scored on Windows runtime evidence; the first Windows CI run is the follow-up that can raise Platform coverage.

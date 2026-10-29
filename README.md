@@ -20,7 +20,8 @@ int main(void) {
 ```json
 {"container":"flac","duration_ms":213400,"duration_is_estimate":false,
  "bitrate_bps":903112,"streams":[{"kind":"audio","codec":"flac",
- "width":null,"height":null,"sample_rate":44100,"channels":2,"language":null}]}
+ "width":null,"height":null,"sample_rate":44100,"channels":2,"language":null,
+ "frame_rate":null,"field_order":null}]}
 ```
 
 Every field is either a value read out of the file or `null`. MediaKit never guesses: if a container does not store a value, the field is null, and the table below says exactly which is which.
@@ -36,19 +37,19 @@ Containers are detected by content (magic bytes), never by file extension.
 
 ## Format support
 
-What v0.1 extracts per format — anything not listed is reported `null`:
+What v0.2 extracts per format — anything not listed is reported `null`:
 
-| Format | Container name | Duration | Duration exact? | Codec | Width/Height | Sample rate | Channels | Language |
-|---|---|---|---|---|---|---|---|---|
-| WAV (RIFF) | `wav` | from `data` chunk size ÷ byte rate | yes | from format tag (`pcm`, `ieee_float`, `mp3`, …; extensible GUID resolved) | — | yes | yes | — |
-| MP3 | `mp3` | Xing/Info frame count when present, else size ÷ first-frame bitrate | only with Xing/Info (`duration_is_estimate` says which) | `mp3` | — | yes (first frame) | yes (first frame) | — |
-| FLAC | `flac` | total samples ÷ sample rate from STREAMINFO | yes (null when the file stores total samples = 0) | `flac` | — | yes | yes | — |
-| Ogg Vorbis | `ogg` | last page's granule position ÷ rate | yes when a final granule is findable, else null | `vorbis` | — | yes | yes | — |
-| Ogg Opus | `ogg` | last granule (minus preskip) at 48 kHz | yes when findable, else null | `opus` | — | the OpusHead input rate when nonzero, else null | yes | — |
-| Ogg, other codec | `ogg` | null | — | null (stream reported as kind `other`) | — | — | — | — |
-| MP4 / MOV | `mp4` / `mov` (QuickTime brand) | `mvhd` timescale/duration; falls back to the longest track | yes | first `stsd` entry type (`avc1`, `mp4a`, …) | from `tkhd` | audio tracks: from the `mp4a`-style sample entry | audio tracks: same source | `mdhd` packed code, or `elng` when present |
-| Matroska / WebM | `matroska` / `webm` (from DocType) | `Info` Duration × TimecodeScale | yes (null when the element is absent) | CodecID string, verbatim (`V_VP9`, `A_OPUS`, …) | `PixelWidth`/`PixelHeight` | `SamplingFrequency` (may be fractional) | yes | `Language` element |
-| AVI (RIFF) | `avi` | longest stream (`strh` length ÷ rate), else `avih` frames × µs-per-frame | yes | stream handler fourcc (or `strf` compression / WAV tag for audio) | from `strf` BITMAPINFOHEADER | audio streams, from `strf` | audio streams, from `strf` | — |
+| Format | Container name | Duration | Duration exact? | Codec | Width/Height | Sample rate | Channels | Language | Frame rate | Field order |
+|---|---|---|---|---|---|---|---|---|---|---|
+| WAV (RIFF) | `wav` | from `data` chunk size ÷ byte rate | yes | from format tag (`pcm`, `ieee_float`, `mp3`, …; extensible GUID resolved) | — | yes | yes | — | — | — |
+| MP3 | `mp3` | Xing/Info frame count when present, else size ÷ first-frame bitrate | only with Xing/Info (`duration_is_estimate` says which) | `mp3` | — | yes (first frame) | yes (first frame) | — | — | — |
+| FLAC | `flac` | total samples ÷ sample rate from STREAMINFO | yes (null when the file stores total samples = 0) | `flac` | — | yes | yes | — | — | — |
+| Ogg Vorbis | `ogg` | last page's granule position ÷ rate | yes when a final granule is findable, else null | `vorbis` | — | yes | yes | — | — | — |
+| Ogg Opus | `ogg` | last granule (minus preskip) at 48 kHz | yes when findable, else null | `opus` | — | the OpusHead input rate when nonzero, else null | yes | — | — | — |
+| Ogg, other codec | `ogg` | null | — | null (stream reported as kind `other`) | — | — | — | — | — | — |
+| MP4 / MOV | `mp4` / `mov` (QuickTime brand) | `mvhd` timescale/duration; falls back to the longest track | yes | first `stsd` entry type (`avc1`, `mp4a`, …) | from `tkhd` | audio tracks: from the `mp4a`-style sample entry | audio tracks: same source | `mdhd` packed ISO code (Macintosh codes and 0x7FFF "unspecified" are null), or `elng` when present | video tracks: samples × timescale ÷ total time from `stts` (an average when timing varies; null beyond 65,536 entries) | `fiel` atom in the sample entry |
+| Matroska / WebM | `matroska` / `webm` (from DocType) | `Info` Duration × TimecodeScale | yes (null when the element is absent) | CodecID string, verbatim (`V_VP9`, `A_OPUS`, …) | `PixelWidth`/`PixelHeight` | `SamplingFrequency` (may be fractional) | yes | `Language` element | video tracks: 10⁹ ÷ `DefaultDuration` (exact as stored, so a rounded NTSC duration gives e.g. `500000000/16683333`) | `FlagInterlaced` / `FieldOrder` |
+| AVI (RIFF) | `avi` | longest stream (`strh` length ÷ rate), else `avih` frames × µs-per-frame | yes | stream handler fourcc (or `strf` compression / WAV tag for audio) | from `strf` BITMAPINFOHEADER | audio streams, from `strf` | audio streams, from `strf` | — | video streams: `strh` rate ÷ scale | — |
 
 Bitrate (`bitrate_bps`) is the overall file bitrate — total bits ÷ duration — except where the format states one directly: WAV reports its byte rate × 8 and MP3 reports its first frame's bitrate. It is `null` whenever the duration is unknown.
 
@@ -70,6 +71,7 @@ Bitrate (`bitrate_bps`) is the overall file bitrate — total bits ÷ duration �
 - MP4 audio sample-entry details assume the classic (version 0) layout; newer versioned audio entries can report `null` channels/rate rather than wrong ones.
 - Ogg page CRCs are not verified, and the final-granule duration assumes the last page in the file belongs to the first stream — true for ordinary single-stream files.
 - AVI codec names are the fourccs stored in the file; no attempt is made to translate them into marketing names.
+- Frame rate and field order come from the container. Values stored only inside the coded video (an H.264 stream's own interlacing flags, for example) are not read, because MediaKit does not parse codec bitstreams — those report `null` even when a decoder-level tool can tell.
 - Poster frames / thumbnails are **not** produced — that is a roadmap item for a companion pipeline, and MediaKit will not fake one from anything else.
 
 ## Building

@@ -1,6 +1,10 @@
 # MediaKit Roadmap
 
-## v0.1.0 (current)
+## v0.2.0 (current)
+
+Adds per-stream `frame_rate` (exact reduced fraction: MP4/MOV `stts` with the track timescale, Matroska `DefaultDuration`, AVI `strh` rate/scale) and `field_order` (QuickTime `fiel`, Matroska `FlagInterlaced`/`FieldOrder`), both video-only and both `null` when the container does not store them. Fixes two v0.1 QuickTime bugs found probing real files: a `minf` data-handler `hdlr` overwrote the track kind (MOV video reported as `other`), and Macintosh / unspecified (`0x7FFF`) `mdhd` language codes were decoded as letters instead of reported `null`.
+
+## v0.1.0
 
 Pure-Rust probing for WAV, MP3, FLAC, Ogg (Vorbis/Opus), MP4/MOV, Matroska/WebM, and AVI behind the `me_probe` / `me_probe_bytes` C ABI: container, duration (exact, or flagged as an estimate for MP3 without a Xing/Info header), overall bitrate, and per-stream codec, dimensions, sample rate, channels, and language where the container stores them. Bounded IO throughout: headers and small windows only.
 

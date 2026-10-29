@@ -13,6 +13,37 @@ use crate::{parse_err, ProbeResult, Reader, StreamInfo, ERR_NOT_SUPPORTED};
 
 type PResult<T> = Result<T, (i32, String)>;
 
+/// `num/den` reduced to lowest terms, or `None` when either part is
+/// zero or the reduced fraction does not fit in 64 bits.
+pub fn reduced_ratio(num: u128, den: u128) -> Option<(u64, u64)> {
+    if num == 0 || den == 0 {
+        return None;
+    }
+    let (mut a, mut b) = (num, den);
+    while b != 0 {
+        (a, b) = (b, a % b);
+    }
+    Some((u64::try_from(num / a).ok()?, u64::try_from(den / a).ok()?))
+}
+
+/// Field order from a QuickTime `fiel` atom (field count, detail)
+/// or a Matroska `FieldOrder` value, in the shared spelling: first
+/// letter is the field coded (stored) first, second the field
+/// displayed first. Undetermined or unknown values are `None`.
+pub fn field_order_name(code: u64) -> Option<String> {
+    match code {
+        0 => Some("progressive"),
+        1 => Some("tt"),
+        6 => Some("bb"),
+        // "Bottom displayed first, top stored first".
+        9 => Some("tb"),
+        // "Top displayed first, bottom stored first".
+        14 => Some("bt"),
+        _ => None,
+    }
+    .map(String::from)
+}
+
 fn empty_result(container: &str) -> ProbeResult {
     ProbeResult {
         container: container.to_string(),
@@ -240,6 +271,11 @@ pub mod avi {
                             kind,
                             ..Default::default()
                         };
+                        // Frames per second is rate / scale for a
+                        // video stream.
+                        if s.kind == "video" {
+                            s.frame_rate = reduced_ratio(u128::from(rate), u128::from(scale));
+                        }
                         // Codec: the handler fourcc, unless it is
                         // all zeros (then strf carries it).
                         if handler != [0, 0, 0, 0] {
@@ -763,7 +799,18 @@ pub mod mp4 {
         channels: Option<u32>,
         language: Option<String>,
         duration_ms: Option<u64>,
+        timescale: Option<u64>,
+        /// (total samples, total sample time) from `stts`, when the
+        /// table fits the read budget.
+        sample_timing: Option<(u128, u128)>,
+        field_order: Option<String>,
     }
+
+    /// Most `stts` entries read for a frame rate: 8 bytes each, so
+    /// 512 KiB at most. Longer tables leave the rate `null`.
+    const MAX_STTS_ENTRIES: u64 = 65_536;
+    /// Most child boxes walked inside one visual sample entry.
+    const MAX_ENTRY_CHILDREN: usize = 32;
 
     #[derive(Default)]
     struct Ctx {
@@ -785,14 +832,25 @@ pub mod mp4 {
             .movie_duration_ms
             .or_else(|| ctx.tracks.iter().filter_map(|t| t.duration_ms).max());
         for t in ctx.tracks {
+            let kind = t.kind.unwrap_or_else(|| "other".to_string());
+            // Average rate: samples × timescale ÷ total sample time.
+            let frame_rate = match (kind.as_str(), t.sample_timing, t.timescale) {
+                ("video", Some((samples, time)), Some(scale)) => {
+                    reduced_ratio(samples.saturating_mul(u128::from(scale)), time)
+                }
+                _ => None,
+            };
+            let field_order = if kind == "video" { t.field_order } else { None };
             out.streams.push(StreamInfo {
-                kind: t.kind.unwrap_or_else(|| "other".to_string()),
+                kind,
                 codec: t.codec,
                 width: t.width,
                 height: t.height,
                 sample_rate: t.sample_rate,
                 channels: t.channels,
                 language: t.language,
+                frame_rate,
+                field_order,
             });
         }
         Ok(out)
@@ -904,13 +962,26 @@ pub mod mp4 {
                     };
                     let packed = r.u16be(lang_off)?;
                     if let Some(t) = track_mut(ctx) {
+                        if timescale > 0 {
+                            t.timescale = Some(timescale);
+                        }
                         t.duration_ms = duration.saturating_mul(1000).checked_div(timescale);
-                        if packed != 0 {
-                            t.language = Some(decode_packed_language(packed));
+                        // Values below 0x400 are Macintosh language codes
+                        // (QuickTime), not packed ISO 639-2 letters; they
+                        // are not reported rather than translated.
+                        if packed >= 0x400 {
+                            let code = decode_packed_language(packed);
+                            if code.len() == 3 {
+                                t.language = Some(code);
+                            }
                         }
                     }
                 }
-                b"hdlr" => {
+                // QuickTime tracks carry a second hdlr inside minf whose
+                // component type is "dhlr" (a data-reference handler,
+                // subtype "alis"/"url "); it says nothing about the
+                // media kind and must not overwrite the mdia one.
+                b"hdlr" if &r.tag(body + 4)? != b"dhlr" => {
                     let handler = r.tag(body + 8)?;
                     if let Some(t) = track_mut(ctx) {
                         t.kind = Some(
@@ -940,6 +1011,27 @@ pub mod mp4 {
                 b"stsd" => {
                     parse_stsd(r, body, box_end, ctx)?;
                 }
+                // version/flags, entry count, then (sample count,
+                // sample delta) pairs.
+                b"stts" if body + 8 <= box_end => {
+                    let entries = u64::from(r.u32be(body + 4)?);
+                    if entries > 0
+                        && entries <= MAX_STTS_ENTRIES
+                        && body + 8 + entries * 8 <= box_end
+                    {
+                        let table = r.exact(body + 8, (entries * 8) as usize)?;
+                        let (mut samples, mut time) = (0u128, 0u128);
+                        for pair in table.chunks_exact(8) {
+                            let count = u32::from_be_bytes([pair[0], pair[1], pair[2], pair[3]]);
+                            let delta = u32::from_be_bytes([pair[4], pair[5], pair[6], pair[7]]);
+                            samples += u128::from(count);
+                            time += u128::from(count) * u128::from(delta);
+                        }
+                        if let Some(t) = track_mut(ctx) {
+                            t.sample_timing = Some((samples, time));
+                        }
+                    }
+                }
                 _ => {}
             }
             if total == 0 {
@@ -964,6 +1056,16 @@ pub mod mp4 {
             return Ok(());
         }
         let ty = r.tag(entry + 4)?;
+        let entry_end = entry
+            .saturating_add(u64::from(r.u32be(entry)?))
+            .min(box_end);
+        let is_video_track = track_mut(ctx).map(|t| t.kind.as_deref()) == Some(Some("video"));
+        if is_video_track {
+            let order = visual_entry_field_order(r, entry, entry_end)?;
+            if let Some(t) = track_mut(ctx) {
+                t.field_order = order;
+            }
+        }
         let codec = String::from_utf8_lossy(&ty)
             .trim()
             .trim_matches('\0')
@@ -993,15 +1095,46 @@ pub mod mp4 {
         Ok(())
     }
 
+    /// The `fiel` atom among a visual sample entry's child boxes,
+    /// which follow the 86-byte entry header: field count (1 =
+    /// progressive, 2 = interlaced) and, for 2, the order code.
+    fn visual_entry_field_order(r: &Reader, entry: u64, entry_end: u64) -> PResult<Option<String>> {
+        let mut pos = entry + 86;
+        for _ in 0..MAX_ENTRY_CHILDREN {
+            if pos + 8 > entry_end {
+                return Ok(None);
+            }
+            let size = u64::from(r.u32be(pos)?);
+            let ty = r.tag(pos + 4)?;
+            if size < 8 {
+                return Ok(None);
+            }
+            if &ty == b"fiel" && size >= 10 && pos + 10 <= entry_end {
+                let fields = r.u8(pos + 8)?;
+                let detail = r.u8(pos + 9)?;
+                return Ok(match fields {
+                    1 => field_order_name(0),
+                    2 => field_order_name(u64::from(detail)),
+                    _ => None,
+                });
+            }
+            pos = pos.saturating_add(size);
+        }
+        Ok(None)
+    }
+
     /// mdhd language: three 5-bit values, each + 0x60 gives the
     /// ASCII letter of an ISO 639-2 code.
     fn decode_packed_language(packed: u16) -> String {
+        // Only 1..=26 map to 'a'..='z'; anything else (QuickTime's
+        // 0x7FFF "unspecified", for one) yields no letter, so the
+        // caller's three-letter check rejects the code.
         let c = |shift: u16| -> char {
             let v = (packed >> shift) & 0x1F;
-            if v == 0 {
-                '\0'
-            } else {
+            if (1..=26).contains(&v) {
                 char::from_u32(u32::from(v) + 0x60).unwrap_or('\0')
+            } else {
+                '\0'
             }
         };
         [c(10), c(5), c(0)]
@@ -1279,6 +1412,7 @@ pub mod matroska {
             kind: "other".to_string(),
             ..Default::default()
         };
+        let mut default_duration = 0u64;
         let mut pos = start;
         while pos < end {
             count(ctx)?;
@@ -1301,12 +1435,19 @@ pub mod matroska {
                     .to_string();
                 }
                 0x86 => stream.codec = Some(read_string(r, body, size)?), // CodecID
+                0x23E383 => default_duration = read_uint(r, body, size)?, // DefaultDuration (ns)
                 0x22B59C => stream.language = Some(read_string(r, body, size)?), // Language
                 ID_VIDEO => parse_video(r, body, (body + size).min(end), &mut stream, ctx)?,
                 ID_AUDIO => parse_audio(r, body, (body + size).min(end), &mut stream, ctx)?,
                 _ => {}
             }
             pos = body + size;
+        }
+        // DefaultDuration is nanoseconds per frame.
+        if stream.kind == "video" {
+            stream.frame_rate = reduced_ratio(1_000_000_000, u128::from(default_duration));
+        } else {
+            stream.field_order = None;
         }
         Ok(stream)
     }
@@ -1318,6 +1459,8 @@ pub mod matroska {
         stream: &mut StreamInfo,
         ctx: &mut Ctx,
     ) -> PResult<()> {
+        let mut flag_interlaced = None;
+        let mut field_order = None;
         let mut pos = start;
         while pos < end {
             count(ctx)?;
@@ -1330,10 +1473,20 @@ pub mod matroska {
             match id {
                 0xB0 => stream.width = Some(read_uint(r, body, size)? as u32), // PixelWidth
                 0xBA => stream.height = Some(read_uint(r, body, size)? as u32), // PixelHeight
+                0x9A => flag_interlaced = Some(read_uint(r, body, size)?),     // FlagInterlaced
+                0x9D => field_order = Some(read_uint(r, body, size)?),         // FieldOrder
                 _ => {}
             }
             pos = body + size;
         }
+        // FlagInterlaced 2 means progressive; otherwise only a stored
+        // FieldOrder says which field comes first (2, the default,
+        // means undetermined and stays null).
+        stream.field_order = match (flag_interlaced, field_order) {
+            (Some(2), _) => field_order_name(0),
+            (_, Some(code)) => field_order_name(code),
+            _ => None,
+        };
         Ok(())
     }
 

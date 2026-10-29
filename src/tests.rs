@@ -651,7 +651,9 @@ fn avi_video_stream_and_duration() {
     assert_eq!(st[0].get("kind").unwrap().as_str(), Some("video"));
     assert_eq!(st[0].get("codec").unwrap().as_str(), Some("XVID"));
     assert_eq!(st[0].get("width").unwrap().as_i64(), Some(640));
-    assert_eq!(st[0].get("height").unwrap().as_i64(), Some(480));
+    assert_eq!(st[0].get("height").unwrap().as_i64(), Some(480)); // strh rate 30 / scale 1.
+    assert_eq!(st[0].get("frame_rate").unwrap().as_str(), Some("30/1"));
+    assert!(st[0].get("field_order").unwrap() == &json::Value::Null);
 }
 
 #[test]
@@ -712,4 +714,288 @@ fn riff_but_not_wave_or_avi_is_unsupported() {
     data.extend_from_slice(b"WEBP");
     let err = probe_bytes(&data).unwrap_err();
     assert_eq!(err.0, ERR_NOT_SUPPORTED);
+}
+
+// ------------------------------------------------------------
+// Frame rate and field order
+// ------------------------------------------------------------
+
+fn stts(entries: &[(u32, u32)]) -> Vec<u8> {
+    let mut p = Vec::new();
+    p.extend_from_slice(&[0; 4]);
+    p.extend_from_slice(&(entries.len() as u32).to_be_bytes());
+    for (count, delta) in entries {
+        p.extend_from_slice(&count.to_be_bytes());
+        p.extend_from_slice(&delta.to_be_bytes());
+    }
+    mp4_box("stts", &p)
+}
+
+/// A visual sample entry with the full 86-byte header and, when
+/// given, a `fiel` child box (field count, order code).
+fn stsd_visual(codec: &str, fiel: Option<(u8, u8)>) -> Vec<u8> {
+    let mut entry = vec![0u8; 86];
+    entry[4..8].copy_from_slice(codec.as_bytes());
+    if let Some((fields, detail)) = fiel {
+        entry.extend_from_slice(&10u32.to_be_bytes());
+        entry.extend_from_slice(b"fiel");
+        entry.extend_from_slice(&[fields, detail]);
+    }
+    let len = entry.len() as u32;
+    entry[0..4].copy_from_slice(&len.to_be_bytes());
+    let mut p = Vec::new();
+    p.extend_from_slice(&[0; 4]);
+    p.extend_from_slice(&1u32.to_be_bytes());
+    p.extend_from_slice(&entry);
+    mp4_box("stsd", &p)
+}
+
+fn mp4_timed_video(handler: &str, stsd: Vec<u8>, timing: Option<Vec<u8>>) -> Vec<u8> {
+    let mut stbl_p = stsd;
+    if let Some(t) = timing {
+        stbl_p.extend_from_slice(&t);
+    }
+    let minf = mp4_box("minf", &mp4_box("stbl", &stbl_p));
+    let mut mdia_p = Vec::new();
+    mdia_p.extend_from_slice(&mdhd_v0(600, 1500, 0));
+    mdia_p.extend_from_slice(&hdlr(handler));
+    mdia_p.extend_from_slice(&minf);
+    let mut trak_p = tkhd(720, 480);
+    trak_p.extend_from_slice(&mp4_box("mdia", &mdia_p));
+    let mut file = mp4_ftyp("qt  ");
+    file.extend_from_slice(&mp4_box("moov", &mp4_box("trak", &trak_p)));
+    file
+}
+
+fn first_stream(data: &[u8]) -> json::Value {
+    streams(&probe(data))[0].clone()
+}
+
+#[test]
+fn mp4_frame_rate_from_stts_constant_and_variable() {
+    // 75 samples of 20 units at a 600 timescale: 30 fps.
+    let cfr = first_stream(&mp4_timed_video(
+        "vide",
+        stsd_video("avc1"),
+        Some(stts(&[(75, 20)])),
+    ));
+    assert_eq!(cfr.get("frame_rate").unwrap().as_str(), Some("30/1"));
+    // 50×20 + 25×40 = 2000 units for 75 samples: 75×600/2000 = 45/2.
+    let vfr = first_stream(&mp4_timed_video(
+        "vide",
+        stsd_video("avc1"),
+        Some(stts(&[(50, 20), (25, 40)])),
+    ));
+    assert_eq!(vfr.get("frame_rate").unwrap().as_str(), Some("45/2"));
+    // NTSC-style timing: 1001 units per frame at 30000.
+    let mut ntsc = mp4_timed_video("vide", stsd_video("avc1"), Some(stts(&[(300, 1001)])));
+    let at = ntsc.windows(4).position(|w| w == b"mdhd").unwrap() + 4 + 12;
+    ntsc[at..at + 4].copy_from_slice(&30000u32.to_be_bytes());
+    assert_eq!(
+        first_stream(&ntsc).get("frame_rate").unwrap().as_str(),
+        Some("30000/1001")
+    );
+}
+
+#[test]
+fn mp4_frame_rate_is_null_without_a_readable_table_or_for_audio() {
+    let none = first_stream(&mp4_timed_video("vide", stsd_video("avc1"), None));
+    assert!(none.get("frame_rate").unwrap() == &json::Value::Null);
+    // A table claiming more entries than the box holds is not read.
+    let mut lying = stts(&[(75, 20)]);
+    lying[12..16].copy_from_slice(&70_000u32.to_be_bytes());
+    let over = first_stream(&mp4_timed_video("vide", stsd_video("avc1"), Some(lying)));
+    assert!(over.get("frame_rate").unwrap() == &json::Value::Null);
+    let audio = first_stream(&mp4_timed_video(
+        "soun",
+        stsd_audio("mp4a", 2, 48000),
+        Some(stts(&[(75, 20)])),
+    ));
+    assert!(audio.get("frame_rate").unwrap() == &json::Value::Null);
+    assert!(audio.get("field_order").unwrap() == &json::Value::Null);
+}
+
+#[test]
+fn mp4_field_order_from_fiel() {
+    let order = |fiel| {
+        first_stream(&mp4_timed_video("vide", stsd_visual("dvsd", fiel), None))
+            .get("field_order")
+            .unwrap()
+            .clone()
+    };
+    assert_eq!(order(Some((2, 1))).as_str(), Some("tt"));
+    assert_eq!(order(Some((2, 6))).as_str(), Some("bb"));
+    assert_eq!(order(Some((2, 9))).as_str(), Some("tb"));
+    assert_eq!(order(Some((2, 14))).as_str(), Some("bt"));
+    assert_eq!(order(Some((1, 0))).as_str(), Some("progressive"));
+    assert!(
+        order(Some((2, 3))) == json::Value::Null,
+        "unknown code stays null"
+    );
+    assert!(order(None) == json::Value::Null, "no fiel atom stays null");
+    let codec = first_stream(&mp4_timed_video(
+        "vide",
+        stsd_visual("dvsd", Some((2, 6))),
+        None,
+    ));
+    assert_eq!(codec.get("codec").unwrap().as_str(), Some("dvsd"));
+}
+
+/// A Matroska file with one video track carrying these extra
+/// TrackEntry and Video child elements.
+fn mkv_video(entry_extra: &[u8], video_extra: &[u8]) -> Vec<u8> {
+    let header = ebml_el(
+        &[0x1A, 0x45, 0xDF, 0xA3],
+        &ebml_str(&[0x42, 0x82], "matroska"),
+    );
+    let mut video_p = ebml_uint(&[0xB0], 720, 2);
+    video_p.extend_from_slice(&ebml_uint(&[0xBA], 576, 2));
+    video_p.extend_from_slice(video_extra);
+    let mut entry_p = ebml_uint(&[0x83], 1, 1);
+    entry_p.extend_from_slice(&ebml_str(&[0x86], "V_MS/VFW/FOURCC"));
+    entry_p.extend_from_slice(entry_extra);
+    entry_p.extend_from_slice(&ebml_el(&[0xE0], &video_p));
+    let tracks = ebml_el(&[0x16, 0x54, 0xAE, 0x6B], &ebml_el(&[0xAE], &entry_p));
+    let mut file = header;
+    file.extend_from_slice(&ebml_el(&[0x18, 0x53, 0x80, 0x67], &tracks));
+    file
+}
+
+#[test]
+fn matroska_frame_rate_from_default_duration() {
+    let pal = first_stream(&mkv_video(
+        &ebml_uint(&[0x23, 0xE3, 0x83], 40_000_000, 4),
+        &[],
+    ));
+    assert_eq!(pal.get("frame_rate").unwrap().as_str(), Some("25/1"));
+    // Stored nanoseconds are rounded, so the exact fraction is kept.
+    let ntsc = first_stream(&mkv_video(
+        &ebml_uint(&[0x23, 0xE3, 0x83], 33_366_667, 4),
+        &[],
+    ));
+    assert_eq!(
+        ntsc.get("frame_rate").unwrap().as_str(),
+        Some("1000000000/33366667")
+    );
+    let none = first_stream(&mkv_video(&[], &[]));
+    assert!(none.get("frame_rate").unwrap() == &json::Value::Null);
+    // The existing fixture's audio track carries no frame rate.
+    let v = probe(&mkv_fixture("webm", true));
+    assert!(streams(&v)[1].get("frame_rate").unwrap() == &json::Value::Null);
+}
+
+#[test]
+fn matroska_field_order_from_interlace_flags() {
+    let order = |video_extra: Vec<u8>| {
+        first_stream(&mkv_video(&[], &video_extra))
+            .get("field_order")
+            .unwrap()
+            .clone()
+    };
+    let flags = |interlaced: Option<u64>, order: Option<u64>| {
+        let mut v = Vec::new();
+        if let Some(i) = interlaced {
+            v.extend_from_slice(&ebml_uint(&[0x9A], i, 1));
+        }
+        if let Some(o) = order {
+            v.extend_from_slice(&ebml_uint(&[0x9D], o, 1));
+        }
+        v
+    };
+    assert_eq!(order(flags(Some(1), Some(1))).as_str(), Some("tt"));
+    assert_eq!(order(flags(Some(1), Some(6))).as_str(), Some("bb"));
+    assert_eq!(order(flags(Some(1), Some(9))).as_str(), Some("tb"));
+    assert_eq!(order(flags(Some(1), Some(14))).as_str(), Some("bt"));
+    assert_eq!(order(flags(Some(2), None)).as_str(), Some("progressive"));
+    assert!(
+        order(flags(Some(1), Some(2))) == json::Value::Null,
+        "undetermined stays null"
+    );
+    assert!(
+        order(flags(Some(1), None)) == json::Value::Null,
+        "interlaced, order unknown"
+    );
+    assert!(order(flags(None, None)) == json::Value::Null);
+}
+
+#[test]
+fn matroska_frame_rate_fixture_truncation_never_panics() {
+    let data = mkv_video(
+        &ebml_uint(&[0x23, 0xE3, 0x83], 40_000_000, 4),
+        &ebml_uint(&[0x9A], 1, 1),
+    );
+    for n in 0..data.len() {
+        let _ = probe_bytes(&data[..n]);
+    }
+    assert!(probe_bytes(&data).is_ok());
+}
+
+#[test]
+fn mp4_frame_rate_fixture_truncation_never_panics() {
+    let data = mp4_timed_video(
+        "vide",
+        stsd_visual("dvsd", Some((2, 6))),
+        Some(stts(&[(50, 20), (25, 40)])),
+    );
+    for n in 0..data.len() {
+        let _ = probe_bytes(&data[..n]);
+    }
+    assert!(probe_bytes(&data).is_ok());
+}
+
+#[test]
+fn ratios_reduce_and_refuse_zero() {
+    assert_eq!(crate::parsers::reduced_ratio(12_800, 512), Some((25, 1)));
+    assert_eq!(
+        crate::parsers::reduced_ratio(30_000, 1001),
+        Some((30000, 1001))
+    );
+    assert_eq!(crate::parsers::reduced_ratio(0, 5), None);
+    assert_eq!(crate::parsers::reduced_ratio(5, 0), None);
+    assert_eq!(
+        crate::parsers::reduced_ratio(u128::MAX, 1),
+        None,
+        "too large to report"
+    );
+}
+
+#[test]
+fn quicktime_data_handler_does_not_hide_the_video_track() {
+    // mdia hdlr says "vide"; the minf hdlr is a data handler
+    // ("dhlr"/"alis") and must not turn the track into "other".
+    let mut dhlr = vec![0u8; 24];
+    dhlr[4..8].copy_from_slice(b"dhlr");
+    dhlr[8..12].copy_from_slice(b"alis");
+    let mut minf_p = mp4_box("hdlr", &dhlr);
+    let mut stbl_p = stsd_visual("avc1", Some((2, 1)));
+    stbl_p.extend_from_slice(&stts(&[(50, 512)]));
+    minf_p.extend_from_slice(&mp4_box("stbl", &stbl_p));
+    let mut mhlr = vec![0u8; 24];
+    mhlr[4..8].copy_from_slice(b"mhlr");
+    mhlr[8..12].copy_from_slice(b"vide");
+    let mut mdia_p = mdhd_v0(12800, 25600, 0); // Macintosh language 0
+    mdia_p.extend_from_slice(&mp4_box("hdlr", &mhlr));
+    mdia_p.extend_from_slice(&mp4_box("minf", &minf_p));
+    let mut trak_p = tkhd(320, 240);
+    trak_p.extend_from_slice(&mp4_box("mdia", &mdia_p));
+    let mut file = mp4_ftyp("qt  ");
+    file.extend_from_slice(&mp4_box("moov", &mp4_box("trak", &trak_p)));
+
+    let st = first_stream(&file);
+    assert_eq!(st.get("kind").unwrap().as_str(), Some("video"));
+    assert_eq!(st.get("frame_rate").unwrap().as_str(), Some("25/1"));
+    assert_eq!(st.get("field_order").unwrap().as_str(), Some("tt"));
+    assert!(
+        st.get("language").unwrap() == &json::Value::Null,
+        "a Macintosh language code is not an ISO code"
+    );
+
+    let mut unspecified = file.clone();
+    let at = unspecified.windows(4).position(|w| w == b"mdhd").unwrap() + 4 + 20;
+    unspecified[at..at + 2].copy_from_slice(&0x7FFFu16.to_be_bytes());
+    let st = first_stream(&unspecified);
+    assert!(
+        st.get("language").unwrap() == &json::Value::Null,
+        "QuickTime's 0x7FFF means unspecified"
+    );
 }
